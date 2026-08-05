@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""opencode-sessions - Sync OpenCode chat sessions with project folders.
+
+Usage:
+  opencode-sessions export <project-dir>     Export sessions for a project to .opencode/sessions/
+  opencode-sessions import <project-dir>     Import sessions from .opencode/sessions/ into DB
+  opencode-sessions sync <project-dir>       Export then immediately import (for same-machine use)
+  opencode-sessions list [project-dir]       List sessions (all or filtered by project)
+  opencode-sessions status <project-dir>     Show sync status for a project
+"""
+
+import sqlite3
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+DB_PATH = os.path.expanduser(os.environ.get("OPENCODE_DATA_DIR", "~/.local/share/opencode"))
+DB_FILE = os.path.join(DB_PATH, "opencode.db")
+SESSIONS_DIR = ".opencode/sessions"
+
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def resolve_project_dir(path_str):
+    p = Path(path_str).expanduser().resolve()
+    if p.is_dir():
+        return str(p)
+    sys.exit(f"Error: '{path_str}' is not a valid directory")
+
+
+def get_project(conn, worktree):
+    for row in conn.execute("SELECT * FROM project WHERE worktree = ?", (worktree,)):
+        return dict(row)
+    return None
+
+
+def get_or_create_project(conn, worktree, name=None):
+    project = get_project(conn, worktree)
+    if project:
+        return project
+    conn.execute("""
+        INSERT INTO project (id, worktree, vcs, name, sandboxes, time_created, time_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+    """, (_new_id("prj"), worktree, _detect_vcs(worktree), name, "[]",
+          int(time.time() * 1000), int(time.time() * 1000)))
+    conn.commit()
+    return get_project(conn, worktree)
+
+
+def _new_id(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:20]}"
+
+
+def _detect_vcs(directory):
+    if os.path.exists(os.path.join(directory, ".git")):
+        return "git"
+    if os.path.exists(os.path.join(directory, ".hg")):
+        return "hg"
+    return None
+
+
+def _ensure_gitignored(project_dir):
+    gitignore_path = os.path.join(project_dir, ".gitignore")
+    entry = ".opencode/"
+
+    if not os.path.exists(gitignore_path):
+        return
+
+    with open(gitignore_path, "r") as f:
+        lines = f.readlines()
+
+    stripped = [line.strip() for line in lines]
+    if entry.strip("/") in stripped or entry in stripped or "/.opencode" in stripped:
+        return
+
+    with open(gitignore_path, "a") as f:
+        if lines and not lines[-1].endswith("\n"):
+            f.write("\n")
+        f.write(f"\n# OpenCode session sync\n{entry}\n")
+
+    print(f"  Added '{entry}' to {gitignore_path}")
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def get_sessions_for_dir(conn, directory):
+    query = """
+        SELECT s.*, p.worktree as project_worktree FROM session s
+        JOIN project p ON s.project_id = p.id
+        WHERE p.worktree = ? AND s.time_archived IS NULL
+        ORDER BY s.time_updated DESC
+    """
+    rows = conn.execute(query, (directory,)).fetchall()
+    if not rows and directory == os.path.expanduser("~"):
+        rows = conn.execute(query, ("/",)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_messages_for_session(conn, session_id):
+    return [dict(r) for r in conn.execute("SELECT * FROM message WHERE session_id = ? ORDER BY time_created", (session_id,)).fetchall()]
+
+
+def get_parts_for_session(conn, session_id):
+    return [dict(r) for r in conn.execute("SELECT * FROM part WHERE session_id = ? ORDER BY time_created", (session_id,)).fetchall()]
+
+
+def export_session(conn, session, session_dir):
+    messages = get_messages_for_session(conn, session["id"])
+    parts = get_parts_for_session(conn, session["id"])
+    project = dict(conn.execute("SELECT * FROM project WHERE id = ?", (session["project_id"],)).fetchone())
+
+    session_clean = {k: v for k, v in session.items() if k != "project_worktree"}
+
+    record = {
+        "version": 1,
+        "exported_at": _now_ms(),
+        "exported_from": os.uname().nodename,
+        "project": {
+            "worktree": project["worktree"],
+            "vcs": project["vcs"],
+            "name": project.get("name"),
+        },
+        "session": session_clean,
+        "messages": messages,
+        "parts": parts,
+    }
+
+    fname = f"{session['id']}.json"
+    fpath = os.path.join(session_dir, fname)
+    with open(fpath, "w") as f:
+        json.dump(record, f, indent=2, default=str)
+    return fpath
+
+
+def import_session(conn, record):
+    session = record["session"]
+    messages = record["messages"]
+    parts = record["parts"]
+    proj_info = record["project"]
+
+    existing = conn.execute("SELECT id FROM session WHERE id = ?", (session["id"],)).fetchone()
+    if existing:
+        return None
+
+    worktree = proj_info["worktree"]
+    project = get_project(conn, worktree)
+    if not project:
+        vcs = proj_info.get("vcs")
+        name = proj_info.get("name")
+        real_vcs = _detect_vcs(worktree)
+        use_vcs = real_vcs if real_vcs else vcs
+        project = get_or_create_project(conn, worktree, name)
+        if use_vcs and use_vcs != project.get("vcs"):
+            conn.execute("UPDATE project SET vcs = ? WHERE id = ?", (use_vcs, project["id"]))
+
+    sid = session["id"]
+    cols = [k for k in session.keys()]
+    vals = [session[k] for k in cols]
+    placeholders = ",".join(["?"] * len(cols))
+    col_names = ",".join(cols)
+    conn.execute(f"INSERT OR IGNORE INTO session ({col_names}) VALUES ({placeholders})", vals)
+
+    for msg in messages:
+        mc = [k for k in msg.keys()]
+        mv = [msg[k] for k in mc]
+        conn.execute(
+            f"INSERT OR IGNORE INTO message ({','.join(mc)}) VALUES ({','.join(['?']*len(mc))})",
+            mv
+        )
+
+    for part in parts:
+        pc = [k for k in part.keys()]
+        pv = [part[k] for k in pc]
+        conn.execute(
+            f"INSERT OR IGNORE INTO part ({','.join(pc)}) VALUES ({','.join(['?']*len(pc))})",
+            pv
+        )
+
+    conn.commit()
+    return session["id"]
+
+
+def cmd_export(project_dir):
+    project_dir = resolve_project_dir(project_dir)
+    conn = get_db()
+    sessions = get_sessions_for_dir(conn, project_dir)
+    if not sessions:
+        print("No sessions found for this project.")
+        conn.close()
+        return
+
+    session_dir = os.path.join(project_dir, SESSIONS_DIR)
+    os.makedirs(session_dir, exist_ok=True)
+    _ensure_gitignored(project_dir)
+
+    exported = 0
+    for s in sessions:
+        fpath = export_session(conn, s, session_dir)
+        print(f"  Exported: {s['title'][:60]} -> {os.path.basename(fpath)}")
+        exported += 1
+
+    conn.close()
+    print(f"\nExported {exported} sessions to {session_dir}")
+
+
+def cmd_import(project_dir):
+    project_dir = resolve_project_dir(project_dir)
+    session_dir = os.path.join(project_dir, SESSIONS_DIR)
+    if not os.path.isdir(session_dir):
+        print(f"No .opencode/sessions/ directory found in {project_dir}")
+        return
+
+    _ensure_gitignored(project_dir)
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    imported = 0
+    skipped = 0
+    for fname in sorted(os.listdir(session_dir)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(session_dir, fname)
+        with open(fpath) as f:
+            record = json.load(f)
+        result = import_session(conn, record)
+        if result:
+            title = record["session"]["title"]
+            print(f"  Imported: {title[:60]}")
+            imported += 1
+        else:
+            skipped += 1
+
+    conn.close()
+    print(f"\nImported {imported} sessions, {skipped} already present")
+
+
+def cmd_sync(project_dir):
+    project_dir = resolve_project_dir(project_dir)
+    print("=== Exporting ===")
+    cmd_export(project_dir)
+    print("\n=== Importing ===")
+    cmd_import(project_dir)
+
+
+def cmd_list(project_dir=None):
+    conn = get_db()
+    if project_dir:
+        project_dir = resolve_project_dir(project_dir)
+        sessions = get_sessions_for_dir(conn, project_dir)
+    else:
+        sessions = [dict(r) for r in conn.execute("""
+            SELECT s.*, p.worktree FROM session s
+            JOIN project p ON s.project_id = p.id
+            WHERE s.time_archived IS NULL
+            ORDER BY s.time_updated DESC
+        """).fetchall()]
+
+    for s in sessions:
+        msg_count = conn.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (s["id"],)).fetchone()[0]
+        worktree = s.get("worktree") or s.get("project_worktree", "?")
+        created = ""
+        if s.get("time_created"):
+            created = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["time_created"] / 1000))
+        print(f"  [{created}] {s['title'][:55]:55s}  msgs:{msg_count:3d}  {worktree}")
+    conn.close()
+
+
+def cmd_status(project_dir):
+    project_dir = resolve_project_dir(project_dir)
+    conn = get_db()
+    db_sessions = get_sessions_for_dir(conn, project_dir)
+    db_ids = {s["id"] for s in db_sessions}
+
+    session_dir = os.path.join(project_dir, SESSIONS_DIR)
+    file_sessions = []
+    if os.path.isdir(session_dir):
+        for fname in sorted(os.listdir(session_dir)):
+            if fname.endswith(".json"):
+                sid = fname.replace(".json", "")
+                with open(os.path.join(session_dir, fname)) as f:
+                    rec = json.load(f)
+                file_sessions.append((sid, rec["session"]["title"]))
+
+    file_ids = {s[0] for s in file_sessions}
+
+    only_db = db_ids - file_ids
+    only_file = file_ids - db_ids
+    both = db_ids & file_ids
+
+    print(f"  In DB only:     {len(only_db)}")
+    print(f"  In project only: {len(only_file)}")
+    print(f"  Synced:          {len(both)}")
+
+    if only_file:
+        print(f"\n  Sessions in project but not in DB (run 'import' to add):")
+        for sid, title in file_sessions:
+            if sid in only_file:
+                print(f"    {title[:60]}")
+    if only_db:
+        print(f"\n  Sessions in DB but not in project (run 'export' to sync):")
+        for s in db_sessions:
+            if s["id"] in only_db:
+                print(f"    {s['title'][:60]}")
+
+    conn.close()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "export" and len(sys.argv) >= 3:
+        cmd_export(sys.argv[2])
+    elif cmd == "import" and len(sys.argv) >= 3:
+        cmd_import(sys.argv[2])
+    elif cmd == "sync" and len(sys.argv) >= 3:
+        cmd_sync(sys.argv[2])
+    elif cmd == "list":
+        cmd_list(sys.argv[2] if len(sys.argv) >= 3 else None)
+    elif cmd == "status" and len(sys.argv) >= 3:
+        cmd_status(sys.argv[2])
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
