@@ -17,7 +17,23 @@ chmod +x ~/.local/bin/opencode-sessions
 
 Requires Python 3. Zero dependencies.
 
-## Usage
+Then install the OpenCode commands:
+
+```bash
+cp commands/*.md ~/.config/opencode/commands/
+```
+
+## OpenCode integration
+
+After installing the commands, use these inside OpenCode:
+
+| Command | Action |
+|---|---|
+| `/sessions-export` | Export sessions for the current project |
+| `/sessions-import` | Import synced sessions from the project |
+| `/sessions-status` | Show sync status |
+
+Or run directly from your shell:
 
 ```
 opencode-sessions export  <dir>    Write sessions from DB into .opencode/sessions/
