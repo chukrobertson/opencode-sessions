@@ -144,7 +144,7 @@ def export_session(conn, session, session_dir):
     return fpath
 
 
-def import_session(conn, record):
+def import_session(conn, record, current_worktree=None):
     session = record["session"]
     messages = record["messages"]
     parts = record["parts"]
@@ -154,16 +154,25 @@ def import_session(conn, record):
     if existing:
         return None
 
-    worktree = proj_info["worktree"]
-    project = get_project(conn, worktree)
+    original_worktree = proj_info["worktree"]
+    project = get_project(conn, original_worktree)
+
+    if not project and current_worktree:
+        project = get_project(conn, current_worktree)
+
     if not project:
         vcs = proj_info.get("vcs")
         name = proj_info.get("name")
-        real_vcs = _detect_vcs(worktree)
+        chosen_worktree = current_worktree if current_worktree and os.path.isdir(current_worktree) else original_worktree
+        real_vcs = _detect_vcs(chosen_worktree)
         use_vcs = real_vcs if real_vcs else vcs
-        project = get_or_create_project(conn, worktree, name)
+        project = get_or_create_project(conn, chosen_worktree, name)
         if use_vcs and use_vcs != project.get("vcs"):
             conn.execute("UPDATE project SET vcs = ? WHERE id = ?", (use_vcs, project["id"]))
+
+    session["project_id"] = project["id"]
+    if "directory" in session and current_worktree and os.path.isdir(current_worktree):
+        session["directory"] = current_worktree
 
     sid = session["id"]
     cols = [k for k in session.keys()]
@@ -237,7 +246,7 @@ def cmd_import(project_dir):
         fpath = os.path.join(session_dir, fname)
         with open(fpath) as f:
             record = json.load(f)
-        result = import_session(conn, record)
+        result = import_session(conn, record, current_worktree=project_dir)
         if result:
             title = record["session"]["title"]
             print(f"  Imported: {title[:60]}")
