@@ -11,7 +11,7 @@ opencode-sessions import ~/my-project   # desktop: load sessions into local DB
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode-sessions/main/opencode-sessions -o ~/.local/bin/opencode-sessions
+curl -fsSL https://raw.githubusercontent.com/chukrobertson/opencode-sessions/master/opencode-sessions -o ~/.local/bin/opencode-sessions
 chmod +x ~/.local/bin/opencode-sessions
 ```
 
