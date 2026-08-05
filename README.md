@@ -2,13 +2,9 @@
 
 Sync [OpenCode](https://opencode.ai) chat history across devices by storing sessions in your project folders.
 
-```
-opencode-sessions export ~/my-project   # laptop: save sessions to .opencode/sessions/
-# ... sync project folder via rsync / Syncthing / Dropbox / NFS / USB drive ...
-opencode-sessions import ~/my-project   # desktop: load sessions into local DB
-```
+## Quick start
 
-## Install
+### Step 1 — install the tool
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chukrobertson/opencode-sessions/master/opencode-sessions -o ~/.local/bin/opencode-sessions
@@ -17,23 +13,45 @@ chmod +x ~/.local/bin/opencode-sessions
 
 Requires Python 3. Zero dependencies.
 
-Then install the OpenCode commands:
+### Step 2 — install the OpenCode commands
 
 ```bash
-cp commands/*.md ~/.config/opencode/commands/
+git clone https://github.com/chukrobertson/opencode-sessions /tmp/opencode-sessions
+mkdir -p ~/.config/opencode/commands
+cp /tmp/opencode-sessions/commands/*.md ~/.config/opencode/commands/
 ```
 
-## OpenCode integration
-
-After installing the commands, use these inside OpenCode:
+Then use these inside OpenCode on any project:
 
 | Command | Action |
 |---|---|
-| `/sessions-export` | Export sessions for the current project |
-| `/sessions-import` | Import synced sessions from the project |
-| `/sessions-status` | Show sync status |
+| `/sessions-export` | Save sessions into `.opencode/sessions/` |
+| `/sessions-import` | Load `.opencode/sessions/` into your DB |
+| `/sessions-status` | Show what needs syncing |
 
-Or run directly from your shell:
+### Step 3 — export, sync, import
+
+On your first machine:
+
+```
+/sessions-export
+```
+
+Sync the project folder to your second machine (rsync, Syncthing, Dropbox, etc.).
+
+On your second machine:
+
+```
+/sessions-import
+```
+
+Your OpenCode sessions now appear on both machines. Repeat in either direction.
+
+Already-imported sessions are skipped — safe to re-run anytime.
+
+## Shell usage
+
+Prefer the terminal?
 
 ```
 opencode-sessions export  <dir>    Write sessions from DB into .opencode/sessions/
@@ -43,27 +61,11 @@ opencode-sessions list    [dir]    Browse all sessions
 opencode-sessions sync    <dir>    Export + import in one step
 ```
 
-## Workflow
-
-**Laptop → desktop:**
-
-```bash
-# 1. On laptop, before syncing:
-opencode-sessions export ~/my-project
-
-# 2. Sync the project folder to your desktop (rsync, Syncthing, Dropbox, etc.)
-
-# 3. On desktop, after syncing:
-opencode-sessions import ~/my-project
-```
-
-Already-imported sessions are skipped — safe to re-run. Do the reverse to go desktop → laptop.
+## Status output
 
 ```
-opencode-sessions status ~/my-project
-```
+$ opencode-sessions status ~/my-project
 
-```
   In DB only:      3      ← run 'export'
   In project only:  5      ← run 'import'
   Synced:          12
@@ -71,7 +73,7 @@ opencode-sessions status ~/my-project
 
 ## How it works
 
-- Reads/writes [OpenCode's SQLite database](https://github.com/anomalyco/opencode) at `~/.local/share/opencode/opencode.db`
+- Reads/writes OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`
 - Each session becomes a JSON file in `.opencode/sessions/` — full conversation, messages, and tool outputs
 - Sessions are UUID-keyed so duplicates are safely ignored
 - Project paths are matched by filesystem path; missing projects are created automatically on import
@@ -79,9 +81,8 @@ opencode-sessions status ~/my-project
 ## .gitignore
 
 The first time you export or import in a project, the tool adds `.opencode/` to that
-project's `.gitignore`. This keeps personal chat history out of version control.
-The JSON files still sync via any file synchronization method — they just won't
-end up in git commits.
+project's `.gitignore`. Sessions stay private — they sync via your file sync tool,
+not via git.
 
 To undo:
 
